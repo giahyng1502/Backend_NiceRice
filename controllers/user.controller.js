@@ -1,105 +1,148 @@
-// controllers/userController.js
-
-const userModel = require("../models/user.model");
+const userService = require('../models/user.model');
+const bcrypt = require("bcryptjs");
 const {unmarshall} = require("@aws-sdk/util-dynamodb");
-
+const {getUserByEmail, createUser} = require("../models/user.model");
+const jwt = require("jsonwebtoken");
+const {unmarshallItems} = require("../utils/unmarshallItems");
+const {generateAccessToken} = require("../utils/genarateToken");
+const redis = require("../config/redis");
 // Tạo user mới
-const createUser = async (req, res) => {
+async function singIn(req, res) {
     try {
-        const { userId, name, email } = req.body;
+        const userData = req.body;
+        userData.password = await bcrypt.hash(userData.password, 12);
 
-        if (!userId || !name || !email) {
-            return res.status(400).json({ error: "userId, name và email là bắt buộc" });
+        const checkEmail = await getUserByEmail(userData.email);
+        if (checkEmail.Count > 0) {
+            return res.status(400).json({message:"Email already exists"});
         }
-
-        await userModel.createUser({ userId, name, email });
-        res.status(201).json({ message: "User created successfully" });
+        const user = await createUser(userData);
+        return res.status(201).json({ message: "User created successfully",...user });
     } catch (error) {
         console.error("Error creating user:", error);
-        res.status(500).json({ error: "Internal server error" });
+        res.status(500).json({ error: "Failed to create user", detail: error.message });
     }
-};
+}
+//
+async function login(req, res) {
+    try {
+        const { email, password } = req.body;
 
-// Lấy user theo userId
-const getUser = async (req, res) => {
+        const userByEmail = await getUserByEmail(email);
+        if (userByEmail.Count === 0) {
+            return res.status(400).json({
+                status: {
+                    code: '400',
+                    message: "Tài khoản này chưa được đăng ký",
+                    label: "API_STATUS_ACCOUNT_NOT_FOUND"
+                }
+            });
+        }
+
+        const user = unmarshallItems(userByEmail.Items)[0];
+        const comparePassword = await bcrypt.compare(password, user.password);
+        if (!comparePassword) {
+            return res.status(400).json({
+                status: {
+                    code: '400',
+                    message: "Thông tin tài khoản hoặc mật khẩu không chính xác",
+                    label: "API_STATUS_INVALID_CREDENTIALS"
+                }
+            });
+        }
+
+        const token = generateAccessToken({ userId: user.userId, email: user.email });
+
+        const { password: _password, ...profile } = user;
+
+        return res.status(200).json({
+            message : 'Đăng nhập thành công',
+            token,
+            profile
+        });
+
+    } catch (error) {
+        console.error("Error login user:", error);
+        res.status(500).json({
+            message : 'Đăng nhập thất bại : ',error,
+            detail: error.message
+        });
+    }
+}
+
+async function getUserById(req, res) {
     try {
         const { userId } = req.params;
-        const user = await userModel.getUserById(userId);
-
+        const user = await userService.getUserById(userId);
         if (!user) {
             return res.status(404).json({ message: "User not found" });
         }
-
-        // Chuyển từ DynamoDB AttributeValue sang object thường
-        const userObj = {
-            userId: user.userId.S,
-            name: user.name.S,
-            email: user.email.S,
-        };
-
-        res.status(200).json(userObj);
+        res.json(user);
     } catch (error) {
-        console.error("Error fetching user:", error);
-        res.status(500).json({ error: "Internal server error" });
+        console.error("Error getting user:", error);
+        res.status(500).json({ error: "Failed to get user" });
     }
-};
+}
 
-const getUsers = async (req, res) => {
+// Lấy tất cả user
+
+async function getAllUsers(req, res) {
     try {
-        const users = await userModel.getAllUsers();
+        // const cacheKey = 'all_users';
+        //
+        // // 1️⃣ Kiểm tra dữ liệu trong cache trước
+        // const cachedData = await redis.get(cacheKey);
+        // if (cachedData) {
+        //     console.log("Lấy data từ cache");
+        //     return res.status(200).json(JSON.parse(cachedData));
+        // }
+
+        // 2️⃣ Nếu chưa có thì query DB
+        const users = await userService.getAllUsers();
+
+        // 3️⃣ Lưu vào cache (ví dụ giữ cache trong 60 giây)
+        // await redis.set(cacheKey, JSON.stringify(users), 'EX', 60);
+
         res.status(200).json(users);
     } catch (error) {
-        console.error("Error getting users:", error);
-        res.status(500).json({ error: "Internal server error" });
+        console.error("Error getting all users:", error);
+        res.status(500).json({ error: "Failed to get users" });
     }
-};
+}
 
 // Cập nhật user theo userId
-const updateUser = async (req, res) => {
+async function updateUser(req, res) {
     try {
         const { userId } = req.params;
-        const { name, email } = req.body;
-
-        if (!name || !email) {
-            return res.status(400).json({ error: "name và email là bắt buộc" });
-        }
-
-        const updatedUser = await userModel.updateUser(userId, { name, email });
-
+        const userData = req.body;
+        const updatedUser = await userService.updateUser(userId, userData);
+        const {$metadata,Attributes}  = updatedUser;
         if (!updatedUser) {
-            return res.status(404).json({ message: "User not found" });
+            return res.status(404).json({ message: "User not found or nothing updated" });
         }
-
-        // Chuyển DynamoDB AttributeValue sang object thường
-        const userObj = {
-            userId: updatedUser.userId.S,
-            name: updatedUser.name.S,
-            email: updatedUser.email.S,
-        };
-
-        res.status(200).json(userObj);
+        res.json({ message: "User updated successfully", user: unmarshall(Attributes), status : $metadata });
     } catch (error) {
         console.error("Error updating user:", error);
-        res.status(500).json({ error: "Internal server error" });
+        res.status(500).json({ error: "Failed to update user", detail: error.message });
     }
-};
+}
 
-// Xóa user theo userId
-const deleteUser = async (req, res) => {
-    try {
-        const { userId } = req.params;
-        await userModel.deleteUser(userId);
-        res.status(200).json({ message: "User deleted successfully" });
-    } catch (error) {
-        console.error("Error deleting user:", error);
-        res.status(500).json({ error: "Internal server error" });
-    }
-};
+// async function deleteUser(req, res) {
+//     try {
+//         const { userId } = req.params;
+//         await userService.deleteUser(userId);
+//         res.json({ message: "User deleted successfully" });
+//     } catch (error) {
+//         console.error("Error deleting user:", error);
+//         res.status(500).json({ error: "Failed to delete user" });
+//     }
+// }
 
 module.exports = {
-    createUser,
-    getUser,
+    singIn,
+    getUserById,
+    getAllUsers,
     updateUser,
-    deleteUser,
-    getUsers
+    login
+    // deleteUser,
 };
